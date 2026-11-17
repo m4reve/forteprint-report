@@ -1,0 +1,3 @@
+# Каждые 5 минут. Замените /opt/bitrix24-google-sheets-sync на фактический путь.
+*/5 * * * * cd /opt/bitrix24-google-sheets-sync && /usr/bin/php bin/sync.php >> var/cron.log 2>&1
+

@@ -1,0 +1,3 @@
+# Полная актуализация персональных таблиц менеджеров каждые 15 минут.
+# Замените путь к проекту и PHP на фактические.
+*/15 * * * * cd /opt/bitrix24-google-sheets-sync && /usr/bin/php bin/sync-managers.php >> var/cron-managers.log 2>&1

@@ -1,0 +1,17 @@
+<?php
+
+/*
+ * Ключ массива — ID пользователя Битрикс24 из поля assignedById.
+ * spreadsheet_id — часть URL Google Sheets между /d/ и /edit.
+ * Каждую таблицу нужно открыть для client_email сервисного аккаунта Google.
+ */
+return array(
+    101 => array(
+        'name' => 'Иван Иванов',
+        'spreadsheet_id' => 'GOOGLE_SPREADSHEET_ID_FOR_MANAGER_101',
+    ),
+    202 => array(
+        'name' => 'Анна Петрова',
+        'spreadsheet_id' => 'GOOGLE_SPREADSHEET_ID_FOR_MANAGER_202',
+    ),
+);
