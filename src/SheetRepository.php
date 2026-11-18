@@ -13,8 +13,9 @@ final class SheetRepository
     private $technicalHeader;
     private $logger;
     private $autoHeaders;
+    private $orderHeader;
 
-    public function __construct(GoogleSheetsClient $sheets, $sheetName, $technicalHeader, $technicalColumn, Logger $logger, array $autoHeaders = array())
+    public function __construct(GoogleSheetsClient $sheets, $sheetName, $technicalHeader, $technicalColumn, Logger $logger, array $autoHeaders = array(), $orderHeader = 'Номер')
     {
         $this->sheets = $sheets;
         $this->sheetName = $sheetName;
@@ -22,6 +23,7 @@ final class SheetRepository
         $this->technicalColumn = $technicalColumn;
         $this->logger = $logger;
         $this->autoHeaders = $autoHeaders;
+        $this->orderHeader = (string) $orderHeader;
     }
 
     public function load($allowHeaderWrite)
@@ -131,7 +133,7 @@ final class SheetRepository
         $techIndex = $this->technicalColumn - 1;
         $dealRows = [];
         $orderRows = [];
-        $orderColumn = isset($this->headerColumns['Номер']) ? $this->headerColumns['Номер'] : null;
+        $orderColumn = isset($this->headerColumns[$this->orderHeader]) ? $this->headerColumns[$this->orderHeader] : null;
         foreach ($this->rows as $i => $row) {
             $rowNumber = $i + 2;
             $dealId = trim((string) (isset($row[$techIndex]) ? $row[$techIndex] : ''));
@@ -151,12 +153,14 @@ final class SheetRepository
 
         $nextRow = count($this->rows) + 2;
         $writes = [];
+        $formulaWrites = [];
+        $highlightCells = array();
         $stats = ['created' => 0, 'updated' => 0, 'unchanged' => 0, 'cells' => 0];
         $requiredRows = 1;
         $sheet = Column::quoteSheet($this->sheetName);
         $incomingOrderCounts = [];
         foreach ($deals as $payload) {
-            $result = $mapper->valueFor('Номер', $payload['deal'], $payload['client']);
+            $result = $mapper->valueFor($this->orderHeader, $payload['deal'], $payload['client']);
             $order = trim((string) (isset($result['value']) ? $result['value'] : ''));
             if ($order !== '') {
                 $incomingOrderCounts[$order] = (isset($incomingOrderCounts[$order]) ? $incomingOrderCounts[$order] : 0) + 1;
@@ -172,7 +176,7 @@ final class SheetRepository
             }
             $rowNumber = isset($dealRows[$dealId]) ? $dealRows[$dealId] : null;
             if ($rowNumber === null) {
-                $orderResult = $mapper->valueFor('Номер', $deal, $client);
+                $orderResult = $mapper->valueFor($this->orderHeader, $deal, $client);
                 $order = trim((string) (isset($orderResult['value']) ? $orderResult['value'] : ''));
                 if (
                     $order !== ''
@@ -195,7 +199,7 @@ final class SheetRepository
             }
             $requiredRows = max($requiredRows, $rowNumber);
 
-            $rowWritesBefore = count($writes);
+            $rowWritesBefore = count($writes) + count($formulaWrites);
             foreach ($this->headerColumns as $header => $columnNumber) {
                 if ($header === $this->technicalHeader) {
                     continue;
@@ -205,12 +209,24 @@ final class SheetRepository
                     continue;
                 }
                 $newValue = $result['value'];
+                $inputOption = isset($result['input_option']) ? $result['input_option'] : 'RAW';
+                if ($inputOption === 'USER_ENTERED' && is_string($newValue) && substr($newValue, 0, 1) === '=') {
+                    $newValue = $this->resolveRowFormula($newValue, $rowNumber);
+                }
                 $oldValue = isset($this->rows[$rowNumber - 2][$columnNumber - 1]) ? $this->rows[$rowNumber - 2][$columnNumber - 1] : '';
                 if (!$this->same($oldValue, $newValue)) {
-                    $writes[] = [
+                    if ($this->hasValue($oldValue)) {
+                        $highlightCells[] = array('row' => $rowNumber, 'column' => $columnNumber);
+                    }
+                    $write = [
                         'range' => $sheet . '!' . Column::letters($columnNumber) . $rowNumber,
                         'values' => [[$newValue]],
                     ];
+                    if ($inputOption === 'USER_ENTERED') {
+                        $formulaWrites[] = $write;
+                    } else {
+                        $writes[] = $write;
+                    }
                 }
             }
 
@@ -222,7 +238,7 @@ final class SheetRepository
                 ];
             }
 
-            $rowChanges = count($writes) - $rowWritesBefore;
+            $rowChanges = count($writes) + count($formulaWrites) - $rowWritesBefore;
             if ($isNew) {
                 $stats['created']++;
             } elseif ($rowChanges > 0) {
@@ -234,7 +250,13 @@ final class SheetRepository
             $dealRows[$dealId] = $rowNumber;
         }
 
-        return ['writes' => $writes, 'stats' => $stats, 'required_rows' => $requiredRows];
+        return array(
+            'writes' => $writes,
+            'formula_writes' => $formulaWrites,
+            'highlight_cells' => $highlightCells,
+            'stats' => $stats,
+            'required_rows' => $requiredRows,
+        );
     }
 
     /**
@@ -271,6 +293,32 @@ final class SheetRepository
             return abs((float) $old - (float) $new) < 0.00000001;
         }
         return trim((string) $old) === trim((string) $new);
+    }
+
+    private function hasValue($value)
+    {
+        if ($value === null) {
+            return false;
+        }
+        if (is_string($value)) {
+            return trim($value) !== '';
+        }
+        if (is_array($value)) {
+            return $value !== array();
+        }
+        // Число 0 и логическое false являются заполненными значениями.
+        return true;
+    }
+
+    private function resolveRowFormula($formula, $rowNumber)
+    {
+        return preg_replace_callback('/\{([^}]+)\}/u', function ($matches) use ($rowNumber) {
+            $header = $this->normalizeHeader($matches[1]);
+            if (!isset($this->headerColumns[$header])) {
+                throw new \RuntimeException("Формула ссылается на отсутствующий столбец «{$header}»");
+            }
+            return Column::letters($this->headerColumns[$header]) . $rowNumber;
+        }, $formula);
     }
 
     private function normalizeHeader($header)

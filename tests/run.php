@@ -10,6 +10,7 @@ require_once dirname(__DIR__) . '/src/Logger.php';
 require_once dirname(__DIR__) . '/src/SheetRepository.php';
 require_once dirname(__DIR__) . '/src/MonthlySheet.php';
 require_once dirname(__DIR__) . '/src/StateStore.php';
+require_once dirname(__DIR__) . '/src/SyncConfig.php';
 require_once dirname(__DIR__) . '/src/SyncService.php';
 
 use App\Bitrix24Client;
@@ -22,6 +23,7 @@ use App\Logger;
 use App\MonthlySheet;
 use App\SheetRepository;
 use App\StateStore;
+use App\SyncConfig;
 use App\SyncService;
 
 class FakeHttpClient extends HttpClient
@@ -69,10 +71,11 @@ class FakeGoogleSheetsClient extends GoogleSheetsClient
         return $this->rows;
     }
 
-    public function batchUpdate(array $data)
+    public function batchUpdate(array $data, $valueInputOption = 'RAW')
     {
         $this->batchUpdateCalls++;
         foreach ($data as $write) {
+            $write['_input_option'] = $valueInputOption;
             $this->writes[] = $write;
         }
         return count($data);
@@ -116,14 +119,16 @@ $mapper = new FieldMapper(
             'Дата создания сделки в Б24' => ['type' => 'field', 'field' => 'createdTime', 'format' => 'date_text'],
             'Дата перехода сделки в Успешно реализовано' => ['type' => 'computed', 'name' => 'won_date'],
             'Дата выставлен счет' => ['type' => 'computed', 'name' => 'invoice_date'],
-            'Тип сделки' => ['type' => 'custom_code', 'field' => 'ufCrm1790575342'],
+            // Код должен иметь приоритет: title намеренно указывает на другое поле.
+            'Тип сделки' => ['type' => 'custom', 'field' => 'UF_CRM_1790575342', 'title' => 'Номер заказа'],
+            'Некорректный код' => ['type' => 'custom', 'field' => 'UF_CRM_DOES_NOT_EXIST', 'title' => 'Номер заказа'],
             'Номер заказа' => ['type' => 'custom', 'title' => 'Номер заказа'],
             'Наличие цветопробы' => ['type' => 'custom', 'title' => 'Наличие цветопробы'],
             'ТЗ ( материал, технология, квадратура)' => ['type' => 'computed', 'name' => 'job_spec'],
             'Ссылка на сделку в Битрикс24' => ['type' => 'computed', 'name' => 'deal_url'],
         ],
         'job_spec_parts' => [
-            ['title' => 'Материал заказа', 'label' => 'Материал'],
+            ['field' => 'UF_CRM_MATERIAL', 'label' => 'Материал'],
             ['title' => 'Технология', 'label' => 'Технология'],
             ['title' => 'Площадь работы, м2', 'label' => 'Площадь', 'suffix' => ' м²'],
         ],
@@ -145,6 +150,7 @@ $testDeal = [
     'ufCrmTechnology' => 'УФ-печать',
     'ufCrmArea' => 12.5,
 ];
+$unresolvedMapperFields = $mapper->unresolvedCustomFields();
 
 $fakeHttp = new FakeHttpClient();
 $fakeBitrix = new Bitrix24Client($fakeHttp, 'https://example.bitrix24.ru/rest/1/token');
@@ -198,7 +204,10 @@ $existingHeaders = array(
     'Дата перехода сделки в Успешно реализовано', 'Тип сделки',
     'Дата выставлен счет',
 );
-$existingRow = array('A-15', '', '', '', '', '', '', '', '', '', '', '42', '', '', '', '', '');
+$existingRow = array(
+    'A-15', '', '', '', '', '', '', '', '', '', '', '42',
+    'https://old.example/crm/deal/details/42/', '', '', '', '',
+);
 $existingSheetClient = new FakeGoogleSheetsClient($existingHeaders, array($existingRow));
 $existingRepository = new SheetRepository(
     $existingSheetClient,
@@ -214,6 +223,98 @@ $existingPlan = $existingRepository->planWrites(array(array(
     'client' => array(),
 )), $linkMapper);
 $staleRanges = $existingRepository->staleRowRanges(array());
+
+$managerMapping = require dirname(__DIR__) . '/config/manager-mapping.php';
+$commonMapping = require dirname(__DIR__) . '/config/common-mapping.php';
+$commonConfigMapping = $commonMapping;
+putenv('COMMON_TECHNICAL_ID_COLUMN=0');
+putenv('COMMON_REBUILD_LAYOUT=0');
+$commonConfig = SyncConfig::forCommon($commonConfigMapping);
+$toUniversalFieldCode = function ($code) {
+    $code = (string) $code;
+    if (preg_match('/^UF_CRM_(.+)$/i', $code, $matches)) {
+        $parts = array_values(array_filter(explode('_', strtolower($matches[1])), 'strlen'));
+        $suffix = '';
+        foreach ($parts as $part) {
+            $suffix .= ctype_digit($part) ? $part : ucfirst($part);
+        }
+        return 'ufCrm' . $suffix;
+    }
+    return $code;
+};
+$managerCodes = array(
+    'order' => $toUniversalFieldCode($managerMapping['columns']['№']['field']),
+    'payment' => $toUniversalFieldCode($managerMapping['columns']['Оплата']['field']),
+    'cost' => $toUniversalFieldCode($managerMapping['columns']['Себес']['field']),
+    'material' => $toUniversalFieldCode($managerMapping['columns']['Материал']['field']),
+    'area' => $toUniversalFieldCode($managerMapping['columns']['Квадратура']['field']),
+    'extra' => $toUniversalFieldCode($managerMapping['columns']['Доп траты']['field']),
+    'recipient' => $toUniversalFieldCode($managerMapping['columns']['Кому']['field']),
+);
+$managerMapper = new FieldMapper(
+    array(
+        $managerCodes['order'] => array('title' => 'Номер заказа', 'type' => 'string'),
+        $managerCodes['payment'] => array('title' => 'Оплата', 'type' => 'string'),
+        $managerCodes['cost'] => array('title' => 'Себестоимость производства', 'type' => 'double'),
+        $managerCodes['material'] => array('title' => 'Материал заказа', 'type' => 'string'),
+        $managerCodes['area'] => array('title' => 'Площадь работы, м2', 'type' => 'double'),
+        $managerCodes['extra'] => array('title' => 'Доп траты', 'type' => 'double'),
+        $managerCodes['recipient'] => array('title' => 'Кому', 'type' => 'string'),
+    ),
+    $managerMapping,
+    $fakeBitrix,
+    array(),
+    array()
+);
+$managerHeaders = array_keys($managerMapping['columns']);
+$managerHeaders[] = 'Bitrix24 Deal ID';
+$managerTechnicalColumn = count($managerMapping['columns']) + 1;
+$managerSheetClient = new FakeGoogleSheetsClient($managerHeaders, array());
+$managerLayout = array();
+foreach (array_keys($managerMapping['columns']) as $index => $header) {
+    $managerLayout[$index + 1] = $header;
+}
+$managerRepository = new SheetRepository(
+    $managerSheetClient,
+    'Сентябрь 2026',
+    'Bitrix24 Deal ID',
+    $managerTechnicalColumn,
+    new Logger('error'),
+    $managerLayout,
+    '№'
+);
+$managerRepository->load(true);
+$managerPlan = $managerRepository->planWrites(array(array(
+    'deal' => array(
+        'id' => 42,
+        'contactIds' => array(77),
+        'comments' => 'Комментарий менеджера',
+        $managerCodes['order'] => 'A-15',
+        '_invoiceStageDate' => '2026-09-10T08:15:00+03:00',
+        'opportunity' => 10000,
+        $managerCodes['payment'] => 'Касса',
+        $managerCodes['cost'] => 4000,
+        $managerCodes['material'] => 'Баннер',
+        $managerCodes['area'] => 12.5,
+        $managerCodes['extra'] => 2000,
+        $managerCodes['recipient'] => 'Производство',
+    ),
+    'client' => array('name' => 'Анна'),
+)), $managerMapper);
+$managerRawRanges = array();
+foreach ($managerPlan['writes'] as $write) {
+    $managerRawRanges[$write['range']] = $write['values'][0][0];
+}
+$managerFormulaRanges = array();
+foreach ($managerPlan['formula_writes'] as $write) {
+    $managerFormulaRanges[$write['range']] = $write['values'][0][0];
+}
+$managerExtraFormulaColumn = array_search('Доп траты 1,5х', array_keys($managerMapping['columns']), true) + 1;
+$managerDeltaColumn = array_search('Дельта', array_keys($managerMapping['columns']), true) + 1;
+$managerContactLinkColumn = array_search('Ссылка на контакт сделки', array_keys($managerMapping['columns']), true) + 1;
+$managerDealLinkColumn = array_search('Ссылка на сделку', array_keys($managerMapping['columns']), true) + 1;
+$managerCommentColumn = array_search('Комментарий', array_keys($managerMapping['columns']), true) + 1;
+$managerTechnicalLetter = Column::letters($managerTechnicalColumn);
 
 $monthlyGoogle = new FakeGoogleSheetsClient();
 $monthlyState = new StateStore(sys_get_temp_dir() . '/bitrix24-google-sheets-sync-test-state.json');
@@ -253,6 +354,8 @@ $tests = [
     'won transition date is mapped from history as date-only text' => $mapper->valueFor('Дата перехода сделки в Успешно реализовано', $testDeal, [])['value'] === '25.09.2026',
     'invoice transition date is mapped from history as date-only text' => $mapper->valueFor('Дата выставлен счет', $testDeal, [])['value'] === '10.09.2026',
     'custom deal type label' => $mapper->valueFor('Тип сделки', $testDeal, [])['value'] === 'Наружная реклама',
+    'symbolic code has priority over title' => $mapper->valueFor('Тип сделки', $testDeal, [])['value'] === 'Наружная реклама',
+    'invalid explicit symbolic code does not fall back to title' => !$mapper->valueFor('Некорректный код', $testDeal, [])['managed'] && isset($unresolvedMapperFields['Некорректный код']),
     'custom field by title' => $mapper->valueFor('Номер заказа', $testDeal, [])['value'] === 'A-15',
     'enum label' => $mapper->valueFor('Наличие цветопробы', $testDeal, [])['value'] === 'Есть',
     'combined job spec' => $mapper->valueFor('ТЗ ( материал, технология, квадратура)', $testDeal, [])['value'] === 'Материал: Баннер; Технология: УФ-печать; Площадь: 12.5 м²',
@@ -261,6 +364,7 @@ $tests = [
     'deal list filters selected funnel' => isset($lastRequest['body']['filter']['categoryId']) && $lastRequest['body']['filter']['categoryId'] === 7,
     'deal list filters assigned manager' => isset($managerDealRequest['body']['filter']['assignedById']) && $managerDealRequest['body']['filter']['assignedById'] === 99,
     'deal list selects lifecycle and custom type fields' => in_array('createdTime', $lastRequest['body']['select'], true) && in_array('ufCrm1790575342', $lastRequest['body']['select'], true),
+    'deal list selects standard comments field' => in_array('comments', $lastRequest['body']['select'], true),
     'stage history dates are loaded' => isset($stageDates['PREPAYMENT_INVOICE']['42']) && $stageDates['PREPAYMENT_INVOICE']['42'] === '2026-09-10T08:15:00+03:00' && isset($stageDates['C7:WON']['42']),
     'stage history filters deal and stages' => isset($stageHistoryRequest['body']['filter']['@OWNER_ID']) && $stageHistoryRequest['body']['filter']['@OWNER_ID'] === array(42) && isset($stageHistoryRequest['body']['filter']['@STAGE_ID']) && $stageHistoryRequest['body']['filter']['@STAGE_ID'] === array('PREPAYMENT_INVOICE', 'C7:WON'),
     'custom deal type field is requested by mapper' => in_array('ufCrm1790575342', $mapper->requiredCustomFieldCodes(), true),
@@ -273,9 +377,23 @@ $tests = [
     'all missing headers use one batch write request' => $sheetClient->batchUpdateCalls === 1,
     'new row gets deal link' => isset($plannedRanges["'Лист1'!M2"]) && $plannedRanges["'Лист1'!M2"] === 'https://example.bitrix24.ru/crm/deal/details/42/',
     'new row gets stable deal id' => isset($plannedRanges["'Лист1'!L2"]) && (string) $plannedRanges["'Лист1'!L2"] === '42',
+    'newly filled cells are not highlighted' => $sheetPlan['highlight_cells'] === array(),
     'existing row is supplemented instead of duplicated' => $existingPlan['stats']['created'] === 0 && $existingPlan['stats']['updated'] === 1 && count($existingPlan['writes']) === 1 && $existingPlan['writes'][0]['range'] === "'Лист1'!M2",
+    'changed non-empty existing cell is highlighted' => $existingPlan['highlight_cells'] === array(array('row' => 2, 'column' => 13)),
     'write plan reports required row capacity' => $sheetPlan['required_rows'] === 2,
     'stale manager row is selected for clearing' => $staleRanges === array("'Лист1'!A2:Q2"),
+    'manager extra costs use locale decimal comma in formula' => isset($managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerExtraFormulaColumn) . '2']) && $managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerExtraFormulaColumn) . '2'] === '=2000*1,5',
+    'manager delta uses row formula' => isset($managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerDeltaColumn) . '2']) && $managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerDeltaColumn) . '2'] === '=D2-F2-I2',
+    'manager layout ends with contact deal and comment fields' => array_slice(array_keys($managerMapping['columns']), -3) === array('Ссылка на контакт сделки', 'Ссылка на сделку', 'Комментарий'),
+    'common table uses exactly manager field mapping' => $commonMapping === $managerMapping,
+    'common table includes deals of all managers' => $commonConfig['assigned_by_id'] === null,
+    'common table uses full stale-row cleanup logic' => $commonConfig['remove_stale_rows'] === true,
+    'common technical id follows all visible fields' => $commonConfig['technical_column'] === count($commonMapping['columns']) + 1,
+    'legacy common mapping remains available' => is_file(dirname(__DIR__) . '/config/mapping.php'),
+    'manager contact link points to first deal contact' => isset($managerRawRanges["'Сентябрь 2026'!" . Column::letters($managerContactLinkColumn) . '2']) && $managerRawRanges["'Сентябрь 2026'!" . Column::letters($managerContactLinkColumn) . '2'] === 'https://example.bitrix24.ru/crm/contact/details/77/',
+    'manager deal link points to deal card' => isset($managerRawRanges["'Сентябрь 2026'!" . Column::letters($managerDealLinkColumn) . '2']) && $managerRawRanges["'Сентябрь 2026'!" . Column::letters($managerDealLinkColumn) . '2'] === 'https://example.bitrix24.ru/crm/deal/details/42/',
+    'manager comment is exported from standard deal field' => isset($managerRawRanges["'Сентябрь 2026'!" . Column::letters($managerCommentColumn) . '2']) && $managerRawRanges["'Сентябрь 2026'!" . Column::letters($managerCommentColumn) . '2'] === 'Комментарий менеджера',
+    'manager layout keeps technical deal id after visible columns' => isset($managerRawRanges["'Сентябрь 2026'!{$managerTechnicalLetter}2"]) && (string) $managerRawRanges["'Сентябрь 2026'!{$managerTechnicalLetter}2"] === '42',
     'sync groups a September deal into September sheet' => isset($monthlyResult['sheets']['Сентябрь 2026']['would_create_sheet']) && $monthlyResult['sheets']['Сентябрь 2026']['deals'] === 1,
 ];
 

@@ -116,11 +116,12 @@ final class SyncService
         uksort($payloadsBySheet, function ($left, $right) {
             return strcmp(MonthlySheet::sortKeyForName($left), MonthlySheet::sortKeyForName($right));
         });
-        $totals = array('created' => 0, 'updated' => 0, 'unchanged' => 0, 'cells' => 0, 'stale_rows_cleared' => 0);
+        $totals = array('created' => 0, 'updated' => 0, 'unchanged' => 0, 'cells' => 0, 'stale_rows_cleared' => 0, 'highlighted_cells' => 0);
         $updatedCells = 0;
         $sheetResults = array();
         foreach ($payloadsBySheet as $sheetName => $payloads) {
             $sheetExists = $this->sheets->sheetExists($sheetName);
+            $layoutReplaced = false;
             if (!$sheetExists && $dryRun) {
                 $count = count($payloads);
                 $totals['created'] += $count;
@@ -128,7 +129,43 @@ final class SyncService
                 continue;
             }
             if (!$dryRun) {
-                $this->sheets->ensureSheet($sheetName);
+                $frozenRowCount = !empty($this->config['freeze_header_row']) ? 1 : 0;
+                $this->sheets->ensureSheet($sheetName, $frozenRowCount);
+                $this->sheets->ensureFrozenRows($sheetName, $frozenRowCount);
+            }
+
+            if ($sheetExists && !empty($this->config['check_sheet_layout'])) {
+                $headerRows = $this->sheets->getValues(Column::quoteSheet($sheetName) . '!A1:AZ1');
+                $actualHeaders = isset($headerRows[0]) ? $headerRows[0] : array();
+                if (!$this->layoutMatches($actualHeaders)) {
+                    if ($dryRun) {
+                        $count = count($payloads);
+                        $totals['created'] += $count;
+                        $sheetResults[$sheetName] = array(
+                            'would_replace_layout' => true,
+                            'deals' => $count,
+                            'created' => $count,
+                        );
+                        continue;
+                    }
+                    if (empty($this->config['replace_sheet_layout'])) {
+                        $rebuildLayoutEnv = isset($this->config['rebuild_layout_env']) && $this->config['rebuild_layout_env'] !== ''
+                            ? $this->config['rebuild_layout_env']
+                            : 'MANAGER_REBUILD_LAYOUT';
+                        throw new \RuntimeException(
+                            "Лист «{$sheetName}» использует старую структуру. Сделайте резервную копию, "
+                            . "установите {$rebuildLayoutEnv}=1 и повторите синхронизацию."
+                        );
+                    }
+                    $this->sheets->batchClear(array(Column::quoteSheet($sheetName) . '!A:AZ'));
+                    $layoutReplaced = true;
+                    $this->logger->warning('Старая структура менеджерского листа очищена для перестройки', array(
+                        'sheet' => $sheetName,
+                    ));
+                }
+            }
+            if (!$dryRun && !empty($this->config['hide_technical_column']) && (!$sheetExists || $layoutReplaced)) {
+                $this->sheets->setColumnHidden($sheetName, $this->config['technical_column'], true);
             }
 
             $repository = new SheetRepository(
@@ -137,7 +174,8 @@ final class SyncService
                 $this->config['technical_header'],
                 $this->config['technical_column'],
                 $this->logger,
-                isset($this->config['layout_headers']) ? $this->config['layout_headers'] : $this->config['auto_headers']
+                isset($this->config['layout_headers']) ? $this->config['layout_headers'] : $this->config['auto_headers'],
+                isset($this->config['order_header']) ? $this->config['order_header'] : 'Номер'
             );
             $repository->load(!$dryRun);
             $missingHeaders = $repository->missingHeaders(array_keys($this->mapping['columns']));
@@ -153,13 +191,17 @@ final class SyncService
                 }
             }
             $staleRanges = $removeStaleRows ? $repository->staleRowRanges($currentDealIds) : array();
+            $highlightCells = !empty($this->config['highlight_changed_cells'])
+                ? $plan['highlight_cells']
+                : array();
             foreach (array('created', 'updated', 'unchanged', 'cells') as $statName) {
                 $totals[$statName] += $plan['stats'][$statName];
             }
             $totals['stale_rows_cleared'] += count($staleRanges);
+            $totals['highlighted_cells'] += count($highlightCells);
 
             if (!$dryRun) {
-                if ($plan['writes'] !== array()) {
+                if ($plan['writes'] !== array() || $plan['formula_writes'] !== array()) {
                     $addedRows = $this->sheets->ensureRowCapacity($sheetName, $plan['required_rows']);
                     if ($addedRows > 0) {
                         $this->logger->info('Google Sheets автоматически расширен', array(
@@ -177,10 +219,20 @@ final class SyncService
                 foreach (array_chunk($plan['writes'], 500) as $chunk) {
                     $updatedCells += $this->sheets->batchUpdate($chunk);
                 }
+                foreach (array_chunk($plan['formula_writes'], 500) as $chunk) {
+                    $updatedCells += $this->sheets->batchUpdate($chunk, 'USER_ENTERED');
+                }
+                foreach (array_chunk($highlightCells, 500) as $cellChunk) {
+                    $this->sheets->highlightCells($cellChunk, $sheetName);
+                }
             }
 
             $sheetResults[$sheetName] = array_merge(
-                array('deals' => count($payloads), 'stale_rows_cleared' => count($staleRanges)),
+                array(
+                    'deals' => count($payloads),
+                    'stale_rows_cleared' => count($staleRanges),
+                    'highlighted_cells' => count($highlightCells),
+                ),
                 $plan['stats']
             );
         }
@@ -199,5 +251,35 @@ final class SyncService
             'month_source_field' => $monthSourceField,
             'sheets' => $sheetResults,
         ), $totals);
+    }
+
+    private function layoutMatches(array $actualHeaders)
+    {
+        $expected = array();
+        $layoutHeaders = isset($this->config['layout_headers']) ? $this->config['layout_headers'] : array();
+        foreach ($layoutHeaders as $column => $header) {
+            $expected[(int) $column - 1] = $this->normalizeHeader($header);
+        }
+        $expected[(int) $this->config['technical_column'] - 1] = $this->normalizeHeader($this->config['technical_header']);
+
+        $lastIndex = max(
+            $actualHeaders === array() ? 0 : count($actualHeaders) - 1,
+            $expected === array() ? 0 : max(array_keys($expected))
+        );
+        for ($index = 0; $index <= $lastIndex; $index++) {
+            $actual = $this->normalizeHeader(isset($actualHeaders[$index]) ? $actualHeaders[$index] : '');
+            $wanted = isset($expected[$index]) ? $expected[$index] : '';
+            if ($actual !== $wanted) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function normalizeHeader($header)
+    {
+        $header = str_replace("\xC2\xA0", ' ', (string) $header);
+        $header = preg_replace('/\s+/u', ' ', $header);
+        return trim($header === null ? '' : $header);
     }
 }

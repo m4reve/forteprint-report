@@ -84,6 +84,95 @@ final class SyncConfig
             'month_source_field' => Env::string('MONTH_SOURCE_FIELD', 'createdTime'),
             'assigned_by_id' => null,
             'remove_stale_rows' => false,
+            'replace_sheet_layout' => false,
+            'check_sheet_layout' => false,
+            'order_header' => 'Номер',
+            'hide_technical_column' => false,
+            'highlight_changed_cells' => false,
+            'freeze_header_row' => Env::int('GOOGLE_FREEZE_HEADER_ROW', 1) === 1,
+            'rebuild_layout_env' => '',
+        );
+    }
+
+    /** Конфигурация отдельной, упрощенной структуры таблиц менеджеров. */
+    public static function forManagers(array &$mapping)
+    {
+        return self::forUnifiedLayout($mapping, 'MANAGER');
+    }
+
+    /** Общая таблица с той же структурой, но без фильтра по менеджеру. */
+    public static function forCommon(array &$mapping)
+    {
+        return self::forUnifiedLayout($mapping, 'COMMON');
+    }
+
+    private static function forUnifiedLayout(array &$mapping, $envPrefix)
+    {
+        $visibleColumnCount = count($mapping['columns']);
+        $firstFreeColumn = $visibleColumnCount + 1;
+        $technicalColumnEnv = $envPrefix . '_TECHNICAL_ID_COLUMN';
+        $technicalHeaderEnv = $envPrefix . '_TECHNICAL_ID_HEADER';
+        $rebuildLayoutEnv = $envPrefix . '_REBUILD_LAYOUT';
+        $highlightEnv = $envPrefix . '_HIGHLIGHT_CHANGED_CELLS';
+        $configuredTechnicalColumn = Env::int($technicalColumnEnv, 0);
+        // Значение 0 включает автоматический режим. Устаревший номер, который уже
+        // занят видимым столбцом, также безопасно переносится в первый свободный.
+        $technicalColumn = $configuredTechnicalColumn <= $visibleColumnCount
+            ? $firstFreeColumn
+            : $configuredTechnicalColumn;
+
+        $layoutHeaders = array();
+        $column = 1;
+        foreach (array_keys($mapping['columns']) as $header) {
+            while ($column === $technicalColumn) {
+                $column++;
+            }
+            $layoutHeaders[$column] = $header;
+            $column++;
+        }
+        if (isset($layoutHeaders[$technicalColumn])) {
+            throw new \RuntimeException($technicalColumnEnv . ' пересекается с видимыми столбцами таблицы');
+        }
+
+        $stageIds = Env::csv('BITRIX24_STAGE_IDS', array());
+        if ($stageIds === array()) {
+            $singleStageId = Env::nullableString('BITRIX24_STAGE_ID');
+            $stageIds = $singleStageId === null ? array() : array($singleStageId);
+        }
+        $wonStageId = Env::nullableString('BITRIX24_WON_STAGE_ID');
+        if ($wonStageId === null) {
+            foreach ($stageIds as $stageId) {
+                if ($stageId === 'WON' || substr($stageId, -4) === ':WON') {
+                    $wonStageId = $stageId;
+                    break;
+                }
+            }
+        }
+        if ($wonStageId === null) {
+            $wonStageId = 'WON';
+        }
+
+        return array(
+            'sheet_name' => Env::string('GOOGLE_SHEET_NAME', 'Лист1'),
+            'technical_header' => Env::string($technicalHeaderEnv, 'Bitrix24 Deal ID'),
+            'technical_column' => $technicalColumn,
+            'lookback_seconds' => Env::int('SYNC_LOOKBACK_SECONDS', 300),
+            'category_id' => Env::nullableString('BITRIX24_CATEGORY_ID'),
+            'stage_ids' => array_values(array_unique($stageIds)),
+            'invoice_stage_id' => Env::string('BITRIX24_INVOICE_STAGE_ID', 'PREPAYMENT_INVOICE'),
+            'won_stage_id' => $wonStageId,
+            'auto_headers' => array(),
+            'layout_headers' => $layoutHeaders,
+            'month_source_field' => Env::string('MONTH_SOURCE_FIELD', 'createdTime'),
+            'assigned_by_id' => null,
+            'remove_stale_rows' => true,
+            'replace_sheet_layout' => Env::int($rebuildLayoutEnv, 0) === 1,
+            'check_sheet_layout' => true,
+            'order_header' => '№',
+            'hide_technical_column' => true,
+            'highlight_changed_cells' => Env::int($highlightEnv, 1) === 1,
+            'freeze_header_row' => Env::int('GOOGLE_FREEZE_HEADER_ROW', 1) === 1,
+            'rebuild_layout_env' => $rebuildLayoutEnv,
         );
     }
 }

@@ -52,7 +52,11 @@ try {
         Env::nullableString('BITRIX24_PORTAL_URL')
     );
     $credentialsPath = $resolve(Env::string('GOOGLE_SERVICE_ACCOUNT_JSON', 'credentials/google-service-account.json'));
-    $mappingTemplate = require $root . '/config/mapping.php';
+    $managerMappingPath = $resolve(Env::string('MANAGER_MAPPING_CONFIG', 'config/manager-mapping.php'));
+    if (!is_file($managerMappingPath)) {
+        throw new RuntimeException("Не найден файл сопоставления менеджерских таблиц {$managerMappingPath}");
+    }
+    $mappingTemplate = require $managerMappingPath;
 
     $lockPath = $resolve(Env::string('MANAGER_SYNC_LOCK_FILE', 'var/sync-managers.lock'));
     if (!is_dir(dirname($lockPath)) && !mkdir(dirname($lockPath), 0770, true) && !is_dir(dirname($lockPath))) {
@@ -76,9 +80,8 @@ try {
             ? (string) $manager['name']
             : ('Менеджер ' . $managerId);
         $mapping = $mappingTemplate;
-        $config = SyncConfig::fromEnv($mapping);
+        $config = SyncConfig::forManagers($mapping);
         $config['assigned_by_id'] = $managerId;
-        $config['remove_stale_rows'] = true;
 
         $sheets = new GoogleSheetsClient(
             $http,

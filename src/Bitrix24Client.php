@@ -56,7 +56,7 @@ final class Bitrix24Client
         $select = array_values(array_unique(array_merge([
             'id', 'title', 'createdTime', 'updatedTime', 'categoryId', 'stageId',
             'assignedById', 'sourceId', 'opportunity', 'closedate', 'contactIds',
-            'contactId', 'companyId',
+            'contactId', 'companyId', 'comments',
         ], $fieldNames)));
 
         $items = [];
@@ -167,6 +167,15 @@ final class Bitrix24Client
             return '';
         }
         return $this->portalBaseUrl . '/crm/deal/details/' . $dealId . '/';
+    }
+
+    public function contactUrl($contactId)
+    {
+        $contactId = (int) $contactId;
+        if ($contactId <= 0 || $this->portalBaseUrl === '') {
+            return '';
+        }
+        return $this->portalBaseUrl . '/crm/contact/details/' . $contactId . '/';
     }
 
     public function clientForDeal(array $deal)

@@ -47,8 +47,28 @@ try {
         $resolve(Env::string('GOOGLE_WRITE_RATE_FILE', 'var/google-write-rate.lock'))
     );
     $state = new StateStore($resolve(Env::string('SYNC_STATE_FILE', 'var/state.json')));
-    $mapping = require $root . '/config/mapping.php';
-    $config = SyncConfig::fromEnv($mapping);
+    $layoutMode = strtolower(Env::string('COMMON_LAYOUT_MODE', 'unified'));
+    if ($layoutMode === 'legacy') {
+        $mappingPath = $resolve(Env::string('LEGACY_COMMON_MAPPING_CONFIG', 'config/mapping.php'));
+        if (!is_file($mappingPath)) {
+            throw new RuntimeException("Не найден старый файл сопоставления {$mappingPath}");
+        }
+        $mapping = require $mappingPath;
+        $config = SyncConfig::fromEnv($mapping);
+        $forceFull = isset($options['full']);
+    } elseif ($layoutMode === 'unified') {
+        $mappingPath = $resolve(Env::string('COMMON_MAPPING_CONFIG', 'config/common-mapping.php'));
+        if (!is_file($mappingPath)) {
+            throw new RuntimeException("Не найден файл сопоставления общей таблицы {$mappingPath}");
+        }
+        $mapping = require $mappingPath;
+        $config = SyncConfig::forCommon($mapping);
+        // Как и персональные таблицы, общая таблица всегда строится по полному
+        // актуальному набору, но без фильтра по ответственному менеджеру.
+        $forceFull = true;
+    } else {
+        throw new RuntimeException('COMMON_LAYOUT_MODE должен быть unified или legacy');
+    }
 
     $lockPath = $resolve(Env::string('SYNC_LOCK_FILE', 'var/sync.lock'));
     if (!is_dir(dirname($lockPath)) && !mkdir(dirname($lockPath), 0770, true) && !is_dir(dirname($lockPath))) {
@@ -60,7 +80,7 @@ try {
     }
 
     $service = new SyncService($bitrix, $sheets, $state, $mapping, $config, $logger);
-    $result = $service->run(isset($options['full']), isset($options['dry-run']), isset($options['diagnose']));
+    $result = $service->run($forceFull, isset($options['dry-run']), isset($options['diagnose']));
     fwrite(STDOUT, json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL);
     flock($lock, LOCK_UN);
     fclose($lock);

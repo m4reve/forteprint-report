@@ -48,12 +48,12 @@ class GoogleSheetsClient
     public function getValues($range)
     {
         $url = 'https://sheets.googleapis.com/v4/spreadsheets/' . rawurlencode($this->spreadsheetId)
-            . '/values/' . rawurlencode($range) . '?majorDimension=ROWS&valueRenderOption=UNFORMATTED_VALUE';
+            . '/values/' . rawurlencode($range) . '?majorDimension=ROWS&valueRenderOption=FORMULA';
         $response = $this->http->requestJson('GET', $url, $this->authHeaders());
         return isset($response['values']) ? $response['values'] : array();
     }
 
-    public function batchUpdate(array $data)
+    public function batchUpdate(array $data, $valueInputOption = 'RAW')
     {
         if ($data === []) {
             return 0;
@@ -62,7 +62,7 @@ class GoogleSheetsClient
         $headers = $this->authHeaders();
         $this->throttleWriteRequest();
         $response = $this->http->requestJson('POST', $url, $headers, [
-            'valueInputOption' => 'RAW',
+            'valueInputOption' => (string) $valueInputOption,
             'data' => $data,
         ]);
         return (int) (isset($response['totalUpdatedCells']) ? $response['totalUpdatedCells'] : 0);
@@ -95,9 +95,10 @@ class GoogleSheetsClient
     }
 
     /** Создает пустой лист, если его еще нет. */
-    public function ensureSheet($sheetName)
+    public function ensureSheet($sheetName, $frozenRowCount = 0)
     {
         $sheetName = (string) $sheetName;
+        $frozenRowCount = max(0, (int) $frozenRowCount);
         $this->loadSheetProperties();
         if (isset($this->sheetProperties[$sheetName])) {
             return false;
@@ -112,7 +113,11 @@ class GoogleSheetsClient
                     'addSheet' => array(
                         'properties' => array(
                             'title' => $sheetName,
-                            'gridProperties' => array('rowCount' => 1000, 'columnCount' => 26),
+                            'gridProperties' => array(
+                                'rowCount' => 1000,
+                                'columnCount' => 26,
+                                'frozenRowCount' => $frozenRowCount,
+                            ),
                         ),
                     ),
                 ),
@@ -136,8 +141,43 @@ class GoogleSheetsClient
             if (!isset($properties['gridProperties']['columnCount'])) {
                 $properties['gridProperties']['columnCount'] = 26;
             }
+            if (!isset($properties['gridProperties']['frozenRowCount'])) {
+                $properties['gridProperties']['frozenRowCount'] = $frozenRowCount;
+            }
             $this->sheetProperties[$sheetName] = $properties;
         }
+        return true;
+    }
+
+    /** Закрепляет заданное количество верхних строк, если настройка еще отличается. */
+    public function ensureFrozenRows($sheetName, $frozenRowCount)
+    {
+        $frozenRowCount = max(0, (int) $frozenRowCount);
+        $properties = $this->sheetProperties($sheetName);
+        $currentCount = isset($properties['gridProperties']['frozenRowCount'])
+            ? (int) $properties['gridProperties']['frozenRowCount']
+            : 0;
+        if ($currentCount === $frozenRowCount) {
+            return false;
+        }
+
+        $url = 'https://sheets.googleapis.com/v4/spreadsheets/' . rawurlencode($this->spreadsheetId) . ':batchUpdate';
+        $headers = $this->authHeaders();
+        $this->throttleWriteRequest();
+        $this->http->requestJson('POST', $url, $headers, array(
+            'requests' => array(
+                array(
+                    'updateSheetProperties' => array(
+                        'properties' => array(
+                            'sheetId' => (int) $properties['sheetId'],
+                            'gridProperties' => array('frozenRowCount' => $frozenRowCount),
+                        ),
+                        'fields' => 'gridProperties.frozenRowCount',
+                    ),
+                ),
+            ),
+        ));
+        $this->sheetProperties[$sheetName]['gridProperties']['frozenRowCount'] = $frozenRowCount;
         return true;
     }
 
@@ -180,6 +220,84 @@ class GoogleSheetsClient
         return $rowsToAdd;
     }
 
+    /** Скрывает или показывает один столбец листа. */
+    public function setColumnHidden($sheetName, $columnNumber, $hidden)
+    {
+        $columnNumber = (int) $columnNumber;
+        if ($columnNumber < 1) {
+            throw new \InvalidArgumentException('Номер столбца должен быть положительным');
+        }
+        $properties = $this->sheetProperties($sheetName);
+        $url = 'https://sheets.googleapis.com/v4/spreadsheets/' . rawurlencode($this->spreadsheetId) . ':batchUpdate';
+        $headers = $this->authHeaders();
+        $this->throttleWriteRequest();
+        $this->http->requestJson('POST', $url, $headers, array(
+            'requests' => array(
+                array(
+                    'updateDimensionProperties' => array(
+                        'range' => array(
+                            'sheetId' => (int) $properties['sheetId'],
+                            'dimension' => 'COLUMNS',
+                            'startIndex' => $columnNumber - 1,
+                            'endIndex' => $columnNumber,
+                        ),
+                        'properties' => array('hiddenByUser' => (bool) $hidden),
+                        'fields' => 'hiddenByUser',
+                    ),
+                ),
+            ),
+        ));
+    }
+
+    /** Закрашивает указанные ячейки светло-желтым цветом. */
+    public function highlightCells(array $cells, $sheetName)
+    {
+        if ($cells === array()) {
+            return 0;
+        }
+        $properties = $this->sheetProperties($sheetName);
+        $requests = array();
+        $seen = array();
+        foreach ($cells as $cell) {
+            $row = isset($cell['row']) ? (int) $cell['row'] : 0;
+            $column = isset($cell['column']) ? (int) $cell['column'] : 0;
+            if ($row < 1 || $column < 1) {
+                continue;
+            }
+            $key = $row . ':' . $column;
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $requests[] = array(
+                'repeatCell' => array(
+                    'range' => array(
+                        'sheetId' => (int) $properties['sheetId'],
+                        'startRowIndex' => $row - 1,
+                        'endRowIndex' => $row,
+                        'startColumnIndex' => $column - 1,
+                        'endColumnIndex' => $column,
+                    ),
+                    'cell' => array(
+                        'userEnteredFormat' => array(
+                            'backgroundColor' => array('red' => 1, 'green' => 0.949, 'blue' => 0.8),
+                        ),
+                    ),
+                    'fields' => 'userEnteredFormat.backgroundColor',
+                ),
+            );
+        }
+        if ($requests === array()) {
+            return 0;
+        }
+
+        $url = 'https://sheets.googleapis.com/v4/spreadsheets/' . rawurlencode($this->spreadsheetId) . ':batchUpdate';
+        $headers = $this->authHeaders();
+        $this->throttleWriteRequest();
+        $this->http->requestJson('POST', $url, $headers, array('requests' => $requests));
+        return count($requests);
+    }
+
     private function sheetProperties($sheetName)
     {
         $sheetName = (string) $sheetName;
@@ -196,7 +314,7 @@ class GoogleSheetsClient
         if ($this->sheetPropertiesLoaded) {
             return;
         }
-        $fields = 'sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))';
+        $fields = 'sheets(properties(sheetId,title,gridProperties(rowCount,columnCount,frozenRowCount)))';
         $url = 'https://sheets.googleapis.com/v4/spreadsheets/' . rawurlencode($this->spreadsheetId)
             . '?fields=' . rawurlencode($fields);
         $response = $this->http->requestJson('GET', $url, $this->authHeaders());
