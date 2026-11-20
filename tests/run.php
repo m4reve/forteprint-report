@@ -46,6 +46,9 @@ class FakeHttpClient extends HttpClient
                 array('ID' => 2, 'OWNER_ID' => 42, 'STAGE_ID' => 'C7:WON', 'CREATED_TIME' => '2026-09-25T12:00:00+03:00'),
             )));
         }
+        if (strpos($url, 'user.get.json') !== false) {
+            return array('result' => array(array('NAME' => 'Иван', 'LAST_NAME' => 'Петров')));
+        }
         return array('result' => array());
     }
 }
@@ -227,6 +230,8 @@ $staleRanges = $existingRepository->staleRowRanges(array());
 $managerMapping = require dirname(__DIR__) . '/config/manager-mapping.php';
 $commonMapping = require dirname(__DIR__) . '/config/common-mapping.php';
 $commonConfigMapping = $commonMapping;
+$commonMapper = new FieldMapper(array(), $commonMapping, $fakeBitrix, array(), array());
+$commonHeaders = array_keys($commonMapping['columns']);
 putenv('COMMON_TECHNICAL_ID_COLUMN=0');
 putenv('COMMON_REBUILD_LAYOUT=0');
 $commonConfig = SyncConfig::forCommon($commonConfigMapping);
@@ -385,7 +390,9 @@ $tests = [
     'manager extra costs use locale decimal comma in formula' => isset($managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerExtraFormulaColumn) . '2']) && $managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerExtraFormulaColumn) . '2'] === '=2000*1,5',
     'manager delta uses row formula' => isset($managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerDeltaColumn) . '2']) && $managerFormulaRanges["'Сентябрь 2026'!" . Column::letters($managerDeltaColumn) . '2'] === '=D2-F2-I2',
     'manager layout ends with contact deal and comment fields' => array_slice(array_keys($managerMapping['columns']), -3) === array('Ссылка на контакт сделки', 'Ссылка на сделку', 'Комментарий'),
-    'common table uses exactly manager field mapping' => $commonMapping === $managerMapping,
+    'common table adds manager after client name' => isset($commonHeaders[3]) && $commonHeaders[3] === 'Менеджер',
+    'manager table does not add redundant manager column' => !isset($managerMapping['columns']['Менеджер']),
+    'common manager field resolves responsible user' => $commonMapper->valueFor('Менеджер', array('assignedById' => 99), array())['value'] === 'Иван Петров',
     'common table includes deals of all managers' => $commonConfig['assigned_by_id'] === null,
     'common table uses full stale-row cleanup logic' => $commonConfig['remove_stale_rows'] === true,
     'common technical id follows all visible fields' => $commonConfig['technical_column'] === count($commonMapping['columns']) + 1,
